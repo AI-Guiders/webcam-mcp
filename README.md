@@ -83,6 +83,31 @@ dotnet publish -c Release -o publish
 
 Ответ: JSON-строка с `burst_dir`, `frames_captured`, `target_fps`, `actual_fps`, `video_path` (если включено), и метаданными кадра.
 
+### `capture_screen_burst`
+
+Делает серию кадров с экрана в течение заданной длительности (вместо веб-камеры).
+
+Обязательный параметр:
+
+- `workspace_path` — путь к workspace.
+
+Опциональные параметры:
+
+- `monitor` (int 1-based слева направо **или** `all`; если указан и `x/y/width/height` не переданы, регион берётся по выбранному монитору; `all` = весь виртуальный экран)
+- `x` / `y` (int, default: начало виртуального экрана)
+- `width` / `height` (int, default: размер виртуального экрана)
+- `duration_sec` (int, default `2`)
+- `target_fps` (int, default `24`)
+- `image_format` (`jpg` | `png`, default `jpg`)
+- `jpeg_quality` (int `1..100`, default `92`)
+- `output_subdir` (relative path, default `.cascade-ide\\screen-captures`)
+- `burst_name` (имя серии, опционально)
+- `save_video` (bool, default `false`)
+- `video_fps` (int, default `24`)
+- `video_format` (`mp4` | `avi`, default `mp4`)
+
+Ответ: JSON-строка с `burst_dir`, `frames_captured`, `target_fps`, `actual_fps`, `capture_region`, `video_path` (если включено) и временем захвата.
+
 ### `analyze_burst_sequence`
 
 Анализирует папку burst как последовательность кадров и возвращает структурный отчёт о динамике.
@@ -198,6 +223,33 @@ dotnet publish -c Release -o publish
 - `session_name` (опционально)
 - `save_video` (bool, default `true`)
 - `video_fps` (int, default `24`)
+
+### `capture_screen_av_burst`
+
+Одновременная запись короткой A/V-сессии: кадры с экрана + WAV с микрофона + метаданные синхронизации.
+
+Обязательный параметр:
+
+- `workspace_path` — путь к workspace.
+
+Опциональные параметры:
+
+- `duration_sec` (int, default `10`)
+- `target_fps` (int, default `24`)
+- `audio_device_number` (int, default `0`)
+- `monitor` (int 1-based слева направо **или** `all`; если указан и `x/y/width/height` не переданы, регион берётся по выбранному монитору; `all` = весь виртуальный экран)
+- `x` / `y` (int, default: начало виртуального экрана)
+- `width` / `height` (int, default: размер виртуального экрана)
+- `audio_sample_rate` (int, default `16000`)
+- `audio_channels` (int, default `1`)
+- `image_format` (`jpg` | `png`, default `jpg`)
+- `jpeg_quality` (int `1..100`, default `92`)
+- `output_subdir` (relative path, default `.cascade-ide\\av-captures`)
+- `session_name` (имя сессии, опционально)
+- `save_video` (bool, default `true`)
+- `video_fps` (int, default `24`)
+
+Ответ: JSON-строка с `session_dir`, `frames_dir`, `audio_path`, `video_path`, `metadata_path`, `frame_count`, `actual_fps`, `capture_region`.
 
 ### `analyze_av_sequence`
 
