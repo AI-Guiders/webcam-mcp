@@ -174,6 +174,8 @@ dotnet publish -c Release -o publish
 
 Локальная транскрипция аудио через Whisper.net (на базе whisper.cpp runtime).
 
+Поддерживаемые форматы: **WAV** (напрямую); **WebM, MP4, M4A** и др. — через конвертацию в WAV с помощью **FFmpeg** (должен быть в PATH). Без FFmpeg для не-WAV файлов вернётся ошибка с подсказкой.
+
 Обязательные параметры:
 
 - `workspace_path`

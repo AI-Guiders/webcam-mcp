@@ -2,6 +2,7 @@ using System.Collections.Frozen;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text.Json;
+using ImageMagick;
 using ModelContextProtocol.Protocol;
 using ModelContextProtocol.Server;
 using NAudio.Wave;
@@ -27,6 +28,8 @@ const int DefaultAudioFrameMs = 50;
 const double DefaultAudioSilenceDb = -45;
 const string EnvWhisperModelPath = "WHISPER_MODEL_PATH";
 const string DefaultAvOutputSubdir = @".cascade-ide\av-captures";
+const string DefaultPdfOutputSubdir = @".cascade-ide\pdf-captures";
+const string EnvTesseractPath = "TESSERACT_PATH";
 
 const int SmXVirtualScreen = 76;
 const int SmYVirtualScreen = 77;
@@ -150,6 +153,47 @@ var toolsList = new List<Tool>
     },
     new()
     {
+        Name = "pdf_capture_burst",
+        Description = "Сделать серию изображений страниц PDF. Сохраняет страницы как картинки в подпапку внутри workspace и возвращает JSON с путём и параметрами страниц.",
+        InputSchema = Schema(new
+        {
+            type = "object",
+            properties = new
+            {
+                workspace_path = new { type = "string", description = "Каталог workspace (корень проекта в Cursor)." },
+                pdf_path = new { type = "string", description = "Путь к PDF-файлу (абсолютный или относительный к workspace)." },
+                from_page = new { type = "integer", description = "Номер первой страницы (1-based, по умолчанию 1)." },
+                to_page = new { type = "integer", description = "Номер последней страницы (1-based, по умолчанию конец файла)." },
+                dpi = new { type = "integer", description = "Плотность рендера в DPI (по умолчанию 200)." },
+                image_format = new { type = "string", description = "Формат кадров: jpg или png (по умолчанию jpg)." },
+                jpeg_quality = new { type = "integer", description = "Качество JPEG 1..100 (по умолчанию 92)." },
+                output_subdir = new { type = "string", description = @"Подкаталог внутри workspace для сохранения страниц (по умолчанию .cascade-ide\pdf-captures)." },
+                burst_name = new { type = "string", description = "Имя серии (опционально, по умолчанию по имени файла)." }
+            },
+            required = new[] { "workspace_path", "pdf_path" }
+        })
+    },
+    new()
+    {
+        Name = "ocr_image_batch",
+        Description = "Сделать OCR для серии изображений (страницы PDF или burst) через внешний tesseract и вернуть JSON по страницам.",
+        InputSchema = Schema(new
+        {
+            type = "object",
+            properties = new
+            {
+                workspace_path = new { type = "string", description = "Каталог workspace (корень проекта в Cursor)." },
+                images_dir = new { type = "string", description = "Путь к папке с изображениями (абсолютный или относительный к workspace)." },
+                lang = new { type = "string", description = "Коды языков tesseract, например \"eng+rus\" (по умолчанию eng)." },
+                sample_every = new { type = "integer", description = "Брать каждый N-й файл (по умолчанию 1)." },
+                max_images = new { type = "integer", description = "Максимум изображений для OCR (по умолчанию 1000)." },
+                output_json_path = new { type = "string", description = "Путь для сохранения JSON (относительно workspace). По умолчанию ocr.json в images_dir." }
+            },
+            required = new[] { "workspace_path", "images_dir" }
+        })
+    },
+    new()
+    {
         Name = "capture_audio_burst",
         Description = "Записать короткий аудиофрагмент с микрофона в WAV по явной команде. Сохраняет файл в workspace (по умолчанию .cascade-ide/audio-captures).",
         InputSchema = Schema(new
@@ -188,7 +232,7 @@ var toolsList = new List<Tool>
     new()
     {
         Name = "transcribe_audio_whisper",
-        Description = "Локальная транскрипция WAV-аудио через Whisper.net (whisper.cpp runtime). Возвращает распознанный текст и сегменты с таймкодами.",
+        Description = "Локальная транскрипция аудио через Whisper.net (whisper.cpp runtime). Поддерживаются WAV и WebM/MP4/M4A (через FFmpeg в PATH). Возвращает распознанный текст и сегменты с таймкодами.",
         InputSchema = Schema(new
         {
             type = "object",
@@ -892,6 +936,313 @@ static string HandleAnalyzeBurstSequence(IReadOnlyDictionary<string, JsonElement
     return JsonSerializer.Serialize(result);
 }
 
+static string HandlePdfCaptureBurst(IReadOnlyDictionary<string, JsonElement> args)
+{
+    var workspacePath = GetRequiredString(args, "workspace_path");
+    var pdfPathInput = GetRequiredString(args, "pdf_path");
+    var fromPageRaw = GetOptionalInt(args, "from_page", 1);
+    var toPageRaw = GetOptionalInt(args, "to_page", int.MaxValue);
+    var dpi = Math.Clamp(GetOptionalInt(args, "dpi", 200), 72, 600);
+    var imageFormat = NormalizeImageFormat(GetOptionalString(args, "image_format") ?? "jpg");
+    var jpegQuality = Math.Clamp(GetOptionalInt(args, "jpeg_quality", DefaultJpegQuality), 1, 100);
+    var outputSubdir = GetOptionalString(args, "output_subdir") ?? DefaultPdfOutputSubdir;
+    var burstName = GetOptionalString(args, "burst_name");
+
+    var workspaceRoot = Path.GetFullPath(workspacePath.Trim());
+    if (File.Exists(workspaceRoot))
+    {
+        workspaceRoot = Path.GetDirectoryName(workspaceRoot) ?? workspaceRoot;
+    }
+
+    if (!Directory.Exists(workspaceRoot))
+    {
+        throw new ArgumentException($"Workspace directory does not exist: {workspaceRoot}");
+    }
+
+    var pdfPath = Path.IsPathRooted(pdfPathInput)
+        ? Path.GetFullPath(pdfPathInput)
+        : Path.GetFullPath(Path.Combine(workspaceRoot, pdfPathInput));
+
+    if (!pdfPath.StartsWith(workspaceRoot, StringComparison.OrdinalIgnoreCase))
+    {
+        throw new ArgumentException("pdf_path points outside of workspace_path.");
+    }
+
+    if (!File.Exists(pdfPath))
+    {
+        throw new ArgumentException($"PDF file does not exist: {pdfPath}");
+    }
+
+    if (!string.Equals(Path.GetExtension(pdfPath), ".pdf", StringComparison.OrdinalIgnoreCase))
+    {
+        throw new ArgumentException("pdf_path must point to a .pdf file.");
+    }
+
+    if (Path.IsPathRooted(outputSubdir))
+    {
+        throw new ArgumentException("output_subdir must be relative to workspace_path.");
+    }
+
+    var outputDir = Path.GetFullPath(Path.Combine(workspaceRoot, outputSubdir));
+    if (!outputDir.StartsWith(workspaceRoot, StringComparison.OrdinalIgnoreCase))
+    {
+        throw new ArgumentException("output_subdir points outside of workspace_path.");
+    }
+
+    Directory.CreateDirectory(outputDir);
+
+    var baseBurstName = string.IsNullOrWhiteSpace(burstName)
+        ? Path.GetFileNameWithoutExtension(pdfPath)
+        : burstName;
+    var safeBurstName = MakeSafeFileName(baseBurstName);
+    var burstDir = Path.Combine(outputDir, safeBurstName);
+    Directory.CreateDirectory(burstDir);
+
+    var settings = new MagickReadSettings
+    {
+        Density = new Density(dpi, dpi)
+    };
+
+    using var images = new MagickImageCollection();
+    images.Read(pdfPath, settings);
+
+    if (images.Count == 0)
+    {
+        throw new ArgumentException("PDF file contains no pages or cannot be rendered. Ensure Ghostscript/ImageMagick delegates for PDF are installed.");
+    }
+
+    var fromPage = Math.Clamp(fromPageRaw, 1, images.Count);
+    var toPage = Math.Clamp(toPageRaw, fromPage, images.Count);
+
+    var pages = new List<object>();
+
+    for (var pageIndex = fromPage; pageIndex <= toPage; pageIndex++)
+    {
+        var image = (MagickImage)images[pageIndex - 1].Clone();
+        image.Format = imageFormat switch
+        {
+            "jpg" => MagickFormat.Jpeg,
+            "png" => MagickFormat.Png,
+            _ => image.Format
+        };
+
+        if (image.Format == MagickFormat.Jpeg)
+        {
+            image.Quality = (uint)jpegQuality;
+        }
+
+        var fileName = $"page-{pageIndex:0000}.{imageFormat}";
+        var outputPath = Path.Combine(burstDir, fileName);
+        image.Write(outputPath);
+
+        pages.Add(new
+        {
+            index = pageIndex,
+            file = outputPath,
+            width = image.Width,
+            height = image.Height
+        });
+
+        image.Dispose();
+    }
+
+    var result = new
+    {
+        success = true,
+        pdf_path = pdfPath,
+        burst_dir = burstDir,
+        from_page = fromPage,
+        to_page = toPage,
+        dpi,
+        image_format = imageFormat,
+        jpeg_quality = jpegQuality,
+        page_count = pages.Count,
+        pages,
+        captured_at_utc = DateTime.UtcNow.ToString("O")
+    };
+
+    return JsonSerializer.Serialize(result);
+}
+
+static string HandleOcrImageBatch(IReadOnlyDictionary<string, JsonElement> args)
+{
+    var workspacePath = GetRequiredString(args, "workspace_path");
+    var imagesDirInput = GetRequiredString(args, "images_dir");
+    var lang = (GetOptionalString(args, "lang") ?? "eng").Trim();
+    var sampleEvery = Math.Clamp(GetOptionalInt(args, "sample_every", 1), 1, 100);
+    var maxImages = Math.Clamp(GetOptionalInt(args, "max_images", 1000), 1, 10000);
+    var outputJsonPathInput = GetOptionalString(args, "output_json_path");
+
+    var workspaceRoot = Path.GetFullPath(workspacePath.Trim());
+    if (File.Exists(workspaceRoot))
+    {
+        workspaceRoot = Path.GetDirectoryName(workspaceRoot) ?? workspaceRoot;
+    }
+
+    if (!Directory.Exists(workspaceRoot))
+    {
+        throw new ArgumentException($"Workspace directory does not exist: {workspaceRoot}");
+    }
+
+    var imagesDir = Path.IsPathRooted(imagesDirInput)
+        ? Path.GetFullPath(imagesDirInput)
+        : Path.GetFullPath(Path.Combine(workspaceRoot, imagesDirInput));
+
+    if (!imagesDir.StartsWith(workspaceRoot, StringComparison.OrdinalIgnoreCase))
+    {
+        throw new ArgumentException("images_dir points outside of workspace_path.");
+    }
+
+    if (!Directory.Exists(imagesDir))
+    {
+        throw new ArgumentException($"Images directory does not exist: {imagesDir}");
+    }
+
+    var supportedExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        ".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"
+    };
+
+    var allImages = Directory
+        .EnumerateFiles(imagesDir)
+        .Where(path => supportedExtensions.Contains(Path.GetExtension(path)))
+        .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+        .ToList();
+
+    if (allImages.Count == 0)
+    {
+        throw new ArgumentException("No image files found in images_dir.");
+    }
+
+    var sampledImages = allImages
+        .Where((_, index) => index % sampleEvery == 0)
+        .Take(maxImages)
+        .ToList();
+
+    if (sampledImages.Count == 0)
+    {
+        sampledImages.Add(allImages[0]);
+    }
+
+    var tesseractExe = Environment.GetEnvironmentVariable(EnvTesseractPath);
+    if (string.IsNullOrWhiteSpace(tesseractExe))
+    {
+        var defaultPath = @"C:\Program Files\Tesseract-OCR\tesseract.exe";
+        tesseractExe = File.Exists(defaultPath) ? defaultPath : "tesseract";
+    }
+
+    var pages = new List<object>();
+    var errors = new List<object>();
+
+    for (var i = 0; i < sampledImages.Count; i++)
+    {
+        var imagePath = sampledImages[i];
+        var fileName = Path.GetFileName(imagePath);
+
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = tesseractExe,
+                Arguments = $"\"{imagePath}\" stdout -l {lang} --psm 3",
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            };
+
+            using var process = Process.Start(psi)
+                ?? throw new ArgumentException($"Failed to start tesseract process for: {imagePath}");
+
+            var output = process.StandardOutput.ReadToEnd();
+            var error = process.StandardError.ReadToEnd();
+            process.WaitForExit();
+
+            if (process.ExitCode != 0)
+            {
+                errors.Add(new
+                {
+                    file = imagePath,
+                    message = $"tesseract exited with code {process.ExitCode}: {error.Trim()}"
+                });
+                continue;
+            }
+
+            pages.Add(new
+            {
+                index = i + 1,
+                file = imagePath,
+                file_name = fileName,
+                text = output.Trim()
+            });
+        }
+        catch (Exception ex)
+        {
+            errors.Add(new
+            {
+                file = imagePath,
+                message = ex.Message
+            });
+        }
+    }
+
+    if (pages.Count == 0 && errors.Count > 0)
+    {
+        throw new ArgumentException("OCR failed for all images. Check that tesseract is installed and accessible.");
+    }
+
+    string? outputJsonPath = null;
+    if (!string.IsNullOrWhiteSpace(outputJsonPathInput))
+    {
+        outputJsonPath = Path.IsPathRooted(outputJsonPathInput)
+            ? Path.GetFullPath(outputJsonPathInput)
+            : Path.GetFullPath(Path.Combine(workspaceRoot, outputJsonPathInput));
+    }
+    else
+    {
+        outputJsonPath = Path.Combine(imagesDir, "ocr.json");
+    }
+
+    if (!outputJsonPath.StartsWith(workspaceRoot, StringComparison.OrdinalIgnoreCase))
+    {
+        throw new ArgumentException("output_json_path points outside of workspace_path.");
+    }
+
+    var resultObject = new
+    {
+        success = true,
+        workspace_path = workspaceRoot,
+        images_dir = imagesDir,
+        lang,
+        sample_every = sampleEvery,
+        max_images = maxImages,
+        images_total = allImages.Count,
+        images_processed = pages.Count,
+        errors = errors,
+        pages,
+        generated_at_utc = DateTime.UtcNow.ToString("O")
+    };
+
+    Directory.CreateDirectory(Path.GetDirectoryName(outputJsonPath)!);
+    File.WriteAllText(outputJsonPath, JsonSerializer.Serialize(resultObject, new JsonSerializerOptions
+    {
+        WriteIndented = true
+    }));
+
+    var result = new
+    {
+        success = true,
+        output_json_path = outputJsonPath,
+        images_processed = pages.Count,
+        images_total = allImages.Count,
+        lang,
+        has_errors = errors.Count > 0,
+        generated_at_utc = DateTime.UtcNow.ToString("O")
+    };
+
+    return JsonSerializer.Serialize(result);
+}
+
 static string HandleCaptureAudioBurst(IReadOnlyDictionary<string, JsonElement> args)
 {
     var workspacePath = GetRequiredString(args, "workspace_path");
@@ -1168,6 +1519,54 @@ static string HandleAnalyzeAudioSequence(IReadOnlyDictionary<string, JsonElement
     return JsonSerializer.Serialize(result);
 }
 
+/// <summary>Resample to 16kHz mono and write 16-bit WAV for Whisper.</summary>
+static void ConvertToWhisperWav(ISampleProvider reader, string normalizedWavPath)
+{
+    if (reader.WaveFormat.Channels == 2)
+    {
+        var stereoToMono = new StereoToMonoSampleProvider(reader)
+        {
+            LeftVolume = 0.5f,
+            RightVolume = 0.5f
+        };
+        reader = stereoToMono;
+    }
+    else if (reader.WaveFormat.Channels > 2)
+    {
+        throw new ArgumentException($"Unsupported channel count: {reader.WaveFormat.Channels}. Use mono/stereo source.");
+    }
+
+    var resampled = new WdlResamplingSampleProvider(reader, 16000);
+    WaveFileWriter.CreateWaveFile16(normalizedWavPath, resampled);
+}
+
+/// <summary>Convert WebM/MP4/etc. to 16kHz mono WAV using FFmpeg. Returns true if successful.</summary>
+static bool TryConvertToWavWithFfmpeg(string inputPath, string outputWavPath)
+{
+    const string ffmpegExe = "ffmpeg";
+    try
+    {
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = ffmpegExe,
+            ArgumentList = { "-y", "-i", inputPath, "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", outputWavPath },
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardError = true,
+            RedirectStandardOutput = true
+        };
+        using var process = Process.Start(startInfo);
+        if (process == null)
+            return false;
+        process.WaitForExit(TimeSpan.FromMinutes(5));
+        return process.ExitCode == 0 && File.Exists(outputWavPath) && new FileInfo(outputWavPath).Length > 44;
+    }
+    catch
+    {
+        return false;
+    }
+}
+
 static string HandleTranscribeAudioWhisper(IReadOnlyDictionary<string, JsonElement> args) =>
     HandleTranscribeAudioWhisperAsync(args).GetAwaiter().GetResult();
 
@@ -1225,26 +1624,23 @@ static async Task<string> HandleTranscribeAudioWhisperAsync(IReadOnlyDictionary<
     Directory.CreateDirectory(tempDir);
     var normalizedWavPath = Path.Combine(tempDir, $"whisper-input-{DateTime.UtcNow:yyyyMMdd-HHmmss-fff}.wav");
 
-    // Whisper runtime is most reliable on 16kHz mono PCM WAV.
-    using (var reader = new AudioFileReader(audioPath))
+    // Whisper runtime is most reliable on 16kHz mono PCM WAV. For WebM/MP4/etc. convert via FFmpeg when available.
+    var ext = Path.GetExtension(audioPath).TrimStart('.').ToLowerInvariant();
+    if (ext == "wav")
     {
-        ISampleProvider sampleProvider = reader;
-        if (reader.WaveFormat.Channels == 2)
+        using (var reader = new AudioFileReader(audioPath))
         {
-            var stereoToMono = new StereoToMonoSampleProvider(sampleProvider)
-            {
-                LeftVolume = 0.5f,
-                RightVolume = 0.5f
-            };
-            sampleProvider = stereoToMono;
+            ConvertToWhisperWav(reader, normalizedWavPath);
         }
-        else if (reader.WaveFormat.Channels > 2)
+    }
+    else
+    {
+        // Non-WAV (e.g. webm, mp4): try FFmpeg to convert to 16kHz mono WAV.
+        if (!TryConvertToWavWithFfmpeg(audioPath, normalizedWavPath))
         {
-            throw new ArgumentException($"Unsupported channel count: {reader.WaveFormat.Channels}. Use mono/stereo source.");
+            throw new ArgumentException(
+                $"Unsupported audio format: .{ext}. For WebM/MP4/M4A etc. install FFmpeg and add it to PATH, or convert the file to WAV manually (16kHz mono recommended).");
         }
-
-        var resampled = new WdlResamplingSampleProvider(sampleProvider, 16000);
-        WaveFileWriter.CreateWaveFile16(normalizedWavPath, resampled);
     }
 
     var segments = new List<object>();
@@ -2153,6 +2549,8 @@ var options = new McpServerOptions
                     "capture_webcam_burst" => HandleCaptureWebcamBurst(args),
                     "capture_screen_burst" => HandleCaptureScreenBurst(args),
                     "analyze_burst_sequence" => HandleAnalyzeBurstSequence(args),
+                    "pdf_capture_burst" => HandlePdfCaptureBurst(args),
+                    "ocr_image_batch" => HandleOcrImageBatch(args),
                     "capture_audio_burst" => HandleCaptureAudioBurst(args),
                     "analyze_audio_sequence" => HandleAnalyzeAudioSequence(args),
                     "transcribe_audio_whisper" => HandleTranscribeAudioWhisper(args),
