@@ -1,5 +1,7 @@
 # Webcam MCP
 
+> **Сплит на отдельные репо:** логика разнесена на [webcam-mcp-shared](../webcam-mcp-shared), [webcam-capture-mcp](../webcam-capture-mcp) и [webcam-analysis-mcp](../webcam-analysis-mcp). Этот каталог можно считать монолитом для обратной совместимости; для новых установок предпочтительны два MCP-сервера из `capture` и `analysis`.
+
 MCP-сервер для **ручного** захвата с камеры и микрофона и передачи данных агенту для анализа.
 Поддерживает одиночный кадр, burst-серии и аудио-burst в WAV.
 
