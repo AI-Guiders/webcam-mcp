@@ -3,6 +3,16 @@
 MCP-сервер для **ручного** захвата с камеры и микрофона и передачи данных агенту для анализа.
 Поддерживает одиночный кадр, burst-серии и аудио-burst в WAV.
 
+## Модульная раскладка
+
+Тот же функционал в стеке **financial-open** разнесён по трём сабмодулям (источник правды — GitLab; на GitHub — зеркала):
+
+- [webcam-mcp-shared](https://github.com/KarataevDmitry/webcam-mcp-shared) — общая библиотека  
+- [webcam-capture-mcp](https://github.com/KarataevDmitry/webcam-capture-mcp) — захват (камера, экран, аудио, A/V)  
+- [webcam-analysis-mcp](https://github.com/KarataevDmitry/webcam-analysis-mcp) — анализ, OCR, Whisper  
+
+**Этот репозиторий** — один процесс со **всеми** тулами в одном MCP; если так проще подключать в `mcp.json`, это остаётся нормальным вариантом.
+
 ## Стек
 
 - C#, .NET 10, win-x64, self-contained
